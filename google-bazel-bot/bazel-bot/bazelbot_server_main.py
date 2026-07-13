@@ -1,12 +1,13 @@
 import argparse
+import bazelbot_server
 import logging
 import os
 import sys
+import utils
 
 from google.cloud.logging.handlers import StructuredLogHandler
+from pathlib import Path
 
-import bazelbot_server
-import utils
 
 parser = argparse.ArgumentParser(description="Bazelbot")
 parser.add_argument(
@@ -32,9 +33,11 @@ logger = logging.getLogger(__name__)
 
 
 def test_commits(bot, test_commits_file):
+    test_commits = Path(test_commits_file)
+    test_commits_result = test_commits.parent / f"results.{test_commits.name}"
     print("Testing commits")
-    with open("results." + test_commits_file, "w") as result_file:
-        with open(test_commits_file, "r") as f:
+    with open(test_commits_result, "w") as result_file:
+        with open(test_commits, "r") as f:
             commits = f.read().splitlines()
             for commit in commits:
                 print(f"Testing commit: {commit}")
