@@ -151,15 +151,23 @@ class BazelRepairBot:
                 break
 
             self.git_repo.create_branch_for_fix(build_data.commit)
+
+            # For local testing, users must use their personal access tokens
+            access_token = (
+                self.git_repo.fork_github_integration.get_access_token(
+                    self.git_repo.gh_fork_installation.id
+                )
+                if self.creds.use_github_app
+                else self.creds.gh_fork_user_token
+            )
+
             # We pass the local path so the agent can read files, and the commit to analyze
             agent_result = asyncio.run(
                 bazel_agent.query_agent(
                     commit_sha=build_data.commit,
                     cmd_processor=self.command_processor,
                     past_fixes=past_fixes[:],
-                    github_token=self.git_repo.fork_github_integration.get_access_token(
-                        self.git_repo.gh_fork_installation.id
-                    ),
+                    github_token=access_token,
                 )
             )
 
@@ -242,9 +250,9 @@ class BazelRepairBot:
                 if not self.set_state_from_latest_build():
                     continue
 
-            builds_to_process: Sequence[
-                utils.BuildInfo
-            ] = self.build_processor.get_builds_to_process(self.last_processed_sha)
+            builds_to_process: Sequence[utils.BuildInfo] = (
+                self.build_processor.get_builds_to_process(self.last_processed_sha)
+            )
             if not builds_to_process:
                 logger.debug("No new builds to process. Sleeping ...")
                 self.wait(self.poll_interval)

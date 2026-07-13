@@ -23,12 +23,13 @@ def parse_targets(error_log: str | None) -> Sequence[str]:
 
 RetryExceptions = Tuple[Type[BaseException], ...]
 
-def call_with_retry(exceptions : RetryExceptions, func, *args, **kwargs):
+
+def call_with_retry(exceptions: RetryExceptions, func, *args, **kwargs):
     """Calls a function and retries it if it raises specified exceptions.
 
     Args:
         exceptions: Tuple of exceptions to catch and retry on.
-        func: The callable to run.        
+        func: The callable to run.
         *args: Positional arguments for func.
         **kwargs: Keyword arguments for func.
     """
@@ -38,10 +39,10 @@ def call_with_retry(exceptions : RetryExceptions, func, *args, **kwargs):
 
     val_delay = DELAY
     func_name = getattr(func, "__name__", str(func))
-    
+
     if not exceptions:
         raise ValueError("At least one exception class must be provided.")
-    
+
     for attempt in range(MAX_RETRIES):
         try:
             return func(*args, **kwargs)
@@ -67,14 +68,25 @@ class BazelBuildResult:
 
 
 class CredentialManager:
-    def __init__(self):
+    def __init__(self, use_github_app: bool):
         self.gh_fork_user = os.getenv("GITHUB_FORK_USER")
         self.gh_pr_user = os.getenv("GITHUB_PR_USER")
         self.bk_token = os.getenv("BUILDKITE_API_TOKEN")
+        self.use_github_app = use_github_app
+
+        # GitHub app details
         self.gh_app_id = os.getenv("GITHUB_APP_ID")
         self.gh_app_private_key = os.getenv("GITHUB_APP_PRIVATE_KEY")
         self.gh_pr_app_id = os.getenv("GITHUB_PR_APP_ID")
         self.gh_pr_app_private_key = os.getenv("GITHUB_PR_APP_PRIVATE_KEY")
+
+        # Used when not using GitHub app
+        self.gh_fork_user_token = os.getenv("GITHUB_FORK_USER_TOKEN")
+        self.gh_pr_user_token = os.getenv("GITHUB_PR_USER_TOKEN")
+        if not self.use_github_app and not self.gh_fork_user_token:
+            raise EnvironmentError(
+                "GITHUB_FORK_USER_TOKEN must be set when not using GitHub app"
+            )
 
     @property
     def gh_fork_repo_name(self):
@@ -226,28 +238,36 @@ class LocalGitRepo:
                 self.repo_path,
             )
         self.repo = git.Repo(repo_path)
-        self.fork_github_integration = github.GithubIntegration(
-            auth=github.Auth.AppAuth(creds.gh_app_id, creds.gh_app_private_key)
-        )
-        self.gh_fork_installation = self.fork_github_integration.get_repo_installation(
-            self.creds.gh_fork_user, "llvm-project"
-        )
-        self.gh_fork_repo = (
-            self.gh_fork_installation.get_github_for_installation().get_repo(
-                self.creds.gh_fork_repo_name
+        
+        if self.creds.use_github_app:
+            self.fork_github_integration = github.GithubIntegration(
+                auth=github.Auth.AppAuth(creds.gh_app_id, creds.gh_app_private_key)
             )
-        )
-        self.pr_github_integration = github.GithubIntegration(
-            auth=github.Auth.AppAuth(creds.gh_pr_app_id, creds.gh_pr_app_private_key)
-        )
-        self.gh_pr_installation = self.pr_github_integration.get_repo_installation(
-            self.creds.gh_pr_user, "llvm-project"
-        )
-        self.gh_pr_repo = (
-            self.gh_pr_installation.get_github_for_installation().get_repo(
-                self.creds.gh_pr_repo_name
+            self.gh_fork_installation = self.fork_github_integration.get_repo_installation(
+                self.creds.gh_fork_user, "llvm-project"
             )
-        )
+            self.gh_fork_repo = (
+                self.gh_fork_installation.get_github_for_installation().get_repo(
+                    self.creds.gh_fork_repo_name
+                )
+            )
+             
+            self.pr_github_integration = github.GithubIntegration(
+                auth=github.Auth.AppAuth(creds.gh_pr_app_id, creds.gh_pr_app_private_key)
+            )
+            self.gh_pr_installation = self.pr_github_integration.get_repo_installation(
+                self.creds.gh_pr_user, "llvm-project"
+            )
+            self.gh_pr_repo = (
+                self.gh_pr_installation.get_github_for_installation().get_repo(
+                    self.creds.gh_pr_repo_name
+                )
+            )
+                
+        else:
+            self.gh_fork_repo = github.Github(self.creds.gh_fork_user_token).get_repo(self.creds.gh_fork_repo_name)
+            self.gh_pr_repo = github.Github(self.creds.gh_pr_user_token).get_repo(self.creds.gh_pr_repo_name) if self.can_create_pr else None
+        
         self.bazel_utils_path = os.path.join(self.repo_path, "utils", "bazel")
         self.main_branch = "main"
         self.remote_name = "origin"
@@ -267,10 +287,7 @@ class LocalGitRepo:
         )
         self.repo.git.checkout("-f", self.main_branch)
         # Force pull by fetching and resetting to overwrite local changes.
-        call_with_retry(
-            (git.GitCommandError,),
-            self.repo.remotes.origin.fetch
-        )
+        call_with_retry((git.GitCommandError,), self.repo.remotes.origin.fetch)
         self.repo.git.reset("--hard", f"{self.remote_name}/{self.main_branch}")
 
         return self.repo.head.commit.hexsha
@@ -316,11 +333,15 @@ class LocalGitRepo:
 
         # 1. Get access token
         try:
-            access_token = call_with_retry(
-                (github.GithubException,),
-                self.fork_github_integration.get_access_token,
-                self.gh_fork_installation.id,
-            ).token
+            access_token = (
+                call_with_retry(
+                    (github.GithubException,),
+                    self.fork_github_integration.get_access_token,
+                    self.gh_fork_installation.id,
+                ).token
+                if self.creds.use_github_app
+                else self.creds.gh_fork_user_token
+            )
         except github.GithubException as e:
             logger.error(f"Failed to get access token: {e}")
             return False
@@ -377,6 +398,11 @@ class LocalGitRepo:
         )
 
         try:
+            if create_pr and not self.creds.gh_pr_user_token:
+                raise EnvironmentError(
+                    "GITHUB_PR_USER_TOKEN must be set to create PR when not using GitHub App."
+                )
+
             pr = call_with_retry(
                 (github.GithubException,),
                 self.gh_pr_repo.create_pull,
